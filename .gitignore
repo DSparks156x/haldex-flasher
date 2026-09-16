@@ -1,0 +1,19 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Hardware captures and generated firmware
+/logs/
+*.bin
+*.hex
+*.s19
+*.srec
+
+# Local adapter libraries and executables
+*.dll
+*.exe
+*.so
+*.dylib
