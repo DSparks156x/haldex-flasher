@@ -1,4 +1,14 @@
-# Shared Haldex flasher
+# Haldex Flasher
+This is a project to flash and readout a Gen4 VW Haldex Controller, or probably most other modules with little adaptation. It is somewhat probably derived from pq-flasher, that EPS RE project. Testing was mostly done on a clone SM2 pro, hence the 32 bit shit, panda is untested and socketcan should work.  
+
+It also contains haldex_patcher.py, a script for patching a Haldex Gen4 (or at least a 0BR 3016 specifically) binary and correcting its checksums. The flasher automatically runs the patcher to correct checksums and apply anti-brick patches, though they only apply to whatever sector you flash.
+
+The anti-brick patches trigger the haldex to drop back into bootloader ready to reflash on checksum and some other errors, rather than ending up in an unflashable bootloop. If you do not apply them, a bad checksum or some other errors will put the haldex in a bootloop, as the stock error handling routine for many things basically just freezes and lets the watchdog reset, within about 40ms. You cannot start a flash section in 40ms, and will need to open the controller and recover via BSL. See BSL folder for that. 
+
+I have flashed this thing over 180 times, I have only had to recover via BSL once. 
+
+
+The rest of this readme is AI written. It looks fine, but i didn't read it all that thoroughly. 
 
 There is one flash/readout implementation for every CAN adapter:
 
@@ -7,10 +17,6 @@ There is one flash/readout implementation for every CAN adapter:
 - `haldex_patcher.py`: strict 320 KiB image validation, anti-brick/simulator patches, and both checksum layers.
 - `tp20.py`, `kwp2000.py`, `j2534.py`: protocol and driver modules.
 
-The adapter-specific flashers, separate dumper, and `calib_checksum.py` have
-been removed. Use the commands below; archived reports retain their original
-historical command lines. `haldex_flash.py` is also directly runnable with the
-same options as the runner.
 
 ## Commands
 
