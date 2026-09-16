@@ -7,6 +7,7 @@ The anti-brick patches trigger the haldex to drop back into bootloader ready to 
 
 I have flashed this thing over 180 times, I have only had to recover via BSL once. 
 
+Do what you want with this stuff, more to be released about the actual editing of this binary eventually. maybe. This took a lot of human time. 
 
 The rest of this readme is AI written. It looks fine, but i didn't read it all that thoroughly. 
 
