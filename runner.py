@@ -1,11 +1,9 @@
-"""CAN adapter ownership for the shared Haldex flash/readout CLI.
-
-The protocol sees one logical bus (0) and can_send/can_recv/can_clear.
-Only this module knows how adapters are opened, normalized, and closed.
-Optional hardware libraries are imported only when opening their adapter.
-"""
-import sys
+"""Adapter-neutral command line for the shared Haldex flash engine."""
+import argparse
+import json
+import logging
 import struct
+import sys
 import time
 from pathlib import Path
 
@@ -13,8 +11,14 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
+def number(value):
+    return int(value, 0)
+
+
 def add_adapter_arguments(parser, default="j2534"):
     parser.add_argument("--adapter", choices=("j2534", "panda", "socketcan"), default=default)
+    parser.add_argument("--dll", help="J2534 DLL path (default: registry discovery)")
+    parser.add_argument("--baud", type=int, default=500000)
     parser.add_argument("--bus", type=int, choices=(0, 1, 2), default=0,
                         help="Physical Panda CAN bus; protocol sees logical bus 0")
     parser.add_argument("--serial", help="Panda serial number")
@@ -35,13 +39,11 @@ class PandaAdapter:
         while True:
             frames = []
             for frame in self.device.can_recv():
-                # Current Panda: (address, data, bus); older releases include
-                # the hardware timestamp as the second of four fields.
                 if len(frame) == 3:
                     address, data, bus = frame
                 else:
                     address, _, data, bus = frame
-                if bus == self.bus:  # excludes TX echoes (bus | 0x80)
+                if bus == self.bus:
                     frames.append((address, bytes(data), 0))
             if frames or time.monotonic() >= deadline:
                 return frames
@@ -55,7 +57,7 @@ class PandaAdapter:
 
     def close(self):
         try:
-            self.device.set_safety_mode(0)  # silent after releasing ownership
+            self.device.set_safety_mode(0)
         finally:
             self.device.close()
 
@@ -72,12 +74,12 @@ class SocketCANAdapter:
 
     def can_recv(self, timeout_ms=10):
         message = self.device.recv(timeout=timeout_ms / 1000)
-        if message is None or message.is_error_frame or message.is_remote_frame or message.is_extended_id:
+        if (message is None or message.is_error_frame or message.is_remote_frame
+                or message.is_extended_id):
             return []
         return [(message.arbitration_id, bytes(message.data), 0)]
 
     def can_clear(self, flags=0xffff):
-        # Bound draining even on a busy vehicle bus.
         for _ in range(4096):
             if self.device.recv(timeout=0) is None:
                 break
@@ -122,16 +124,182 @@ def open_adapter(args):
         if args.bus != 0:
             raise ValueError("Use --channel to select SocketCAN; --bus is a Panda option")
         import can
-        # Configure the Linux interface bitrate before invocation, using the
-        # operating system. Opening a bus does not reconfigure its link.
         bus = can.Bus(interface="socketcan", channel=args.channel, receive_own_messages=False)
         return SocketCANAdapter(bus, can.Message, args.channel)
     raise ValueError(f"Unknown CAN adapter: {args.adapter}")
 
 
+def build_parser():
+    parser = argparse.ArgumentParser(description="Haldex Gen4 shared flasher/readout")
+    add_adapter_arguments(parser)
+    parser.add_argument("--module", type=number, default=0x0A)
+    parser.add_argument("--input", help="320 KiB CPU-linear image to flash")
+    parser.add_argument("--start", type=number, default=0x18000)
+    parser.add_argument("--end", type=number, default=0x4ffff,
+                        help="Inclusive end address")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--yes", action="store_true", help="Skip the destructive YES prompt")
+    parser.add_argument("--ident-only", action="store_true")
+    parser.add_argument("--readout", action="store_true")
+    parser.add_argument("--out", default="data/raw/readout/haldex")
+    parser.add_argument("--reference")
+    parser.add_argument("--readout-passes", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--readout-window", type=number, default=0x10000)
+    parser.add_argument("--recovery", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--simulator-mode", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--log")
+    parser.add_argument("--verbose", action="store_true")
+    return parser
+
+
+def _validate_args(parser, args):
+    from flasher.haldex_patcher import selected_blocks, validate_image
+    if args.readout:
+        conflicts = args.input or args.recovery or args.ident_only or args.simulator_mode
+        if conflicts:
+            parser.error("--readout cannot be combined with flash, recovery, identification, or simulator options")
+        selected_blocks(args.start, args.end)
+        if args.reference:
+            validate_image(Path(args.reference).read_bytes())
+        return
+    if args.recovery:
+        parser.error("--recovery was removed; the shared engine resumes safely through the normal flash path")
+    if args.ident_only:
+        if args.input or args.dry_run or args.simulator_mode:
+            parser.error("--ident-only cannot be combined with flash or dry-run options")
+        return
+    if not args.input:
+        parser.error("--input is required unless --readout or --ident-only is selected")
+    selected_blocks(args.start, args.end)
+
+
+def _progress(stage, percent, detail="", speed=0.0, eta_sec=0.0):
+    suffix = f" {speed:.1f} B/s" if speed else ""
+    if eta_sec:
+        suffix += f" ETA {eta_sec:.1f}s"
+    print(f"[{stage:>10}] {percent:6.1f}% {detail}{suffix}", flush=True)
+
+
+def _configure_logging(args):
+    handlers = [logging.StreamHandler(sys.stderr)]
+    if args.log:
+        handlers.append(logging.FileHandler(args.log, encoding="utf-8"))
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
+
+
+def run_ident(args):
+    from flasher.haldex_flasher import HaldexFlasher
+    device = open_adapter(args)
+    flasher = HaldexFlasher(device=device, module=args.module,
+                            device_factory=lambda: open_adapter(args), progress_cb=_progress)
+    result = flasher.read_ecu_info()  # owns and closes the injected adapter
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def run_flash(args):
+    from flasher.artifacts import prepare_image
+    prepared = prepare_image(args.input, args.start, args.end,
+                             simulator_mode=args.simulator_mode)
+    if args.dry_run:
+        print(json.dumps(dict(prepared["metadata"], status="validated", dry_run=True),
+                         indent=2, sort_keys=True))
+        return 0
+    print(json.dumps(prepared["metadata"], indent=2, sort_keys=True))
+    if not args.yes and input("Type YES to erase and flash the selected sectors: ") != "YES":
+        print("Cancelled before adapter access.")
+        return 1
+    from flasher.haldex_flasher import HaldexFlasher
+    device = open_adapter(args)
+    flasher = HaldexFlasher(device=device, module=args.module,
+                            device_factory=lambda: open_adapter(args), progress_cb=_progress)
+    result = flasher.flash_binary(args.input, args.start, args.end,
+                                  simulator_mode=args.simulator_mode)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def run_readout(args):
+    from flasher.haldex_flash import (ApplicationReader, IMAGE_SIZE, TP20Transport,
+                                      application_checksums, capture, compare_reference)
+    length = args.end - args.start + 1
+    plan = {"operation": "readout", "adapter": args.adapter, "start": args.start,
+            "end": args.end, "length": length, "passes": args.readout_passes,
+            "window": args.readout_window, "hardware_access": not args.dry_run,
+            "firmware_writes": False}
+    if args.dry_run:
+        print(json.dumps(plan, indent=2, sort_keys=True))
+        return 0
+
+    output = Path(args.out)
+    output.mkdir(parents=True, exist_ok=False)
+    events = []
+    cleanup_errors = []
+    report = dict(plan, status="in_progress", cleanup_errors=cleanup_errors)
+    device = None
+    tp = None
+    reader = None
+    try:
+        device = open_adapter(args)
+        tp = TP20Transport(device, module=args.module, timeout=2.0, debug=args.verbose)
+        reader = ApplicationReader(tp, events.append)
+        report["identification_hex"] = reader.identify().hex()
+        reader.enter()
+        captures = capture(
+            reader, output, args.start, length, args.readout_passes,
+            args.readout_window, events.append,
+            lambda p, done, total: _progress(f"READ {p}", 100 * done / total,
+                                             f"{done}/{total} bytes"),
+        )
+        report["captures"] = captures
+        report["saved_ranges"] = {
+            item["path"]: {"start": args.start, "end_exclusive": args.end + 1}
+            for item in captures
+        }
+        captured = (output / captures[0]["path"]).read_bytes()[args.start:args.end + 1]
+        checksums = application_checksums(captured, args.start)
+        report["application_checksums"] = checksums
+        if args.reference:
+            report["comparisons"] = [compare_reference(captured, args.start, args.reference)]
+        invalid = any(row["valid"] is False for row in checksums)
+        report["status"] = "checksum_mismatch" if invalid else "captured_checksums_valid"
+    except Exception as exc:
+        report.update(status="requires_attention", error=f"{type(exc).__name__}: {exc}")
+    finally:
+        if reader is not None:
+            cleanup_errors.extend(reader.leave())
+        if tp is not None:
+            try:
+                tp.disconnect()
+            except Exception as exc:
+                cleanup_errors.append(f"disconnect: {exc}")
+        if device is not None:
+            try:
+                device.close()
+            except Exception as exc:
+                cleanup_errors.append(f"adapter close: {exc}")
+        if cleanup_errors:
+            report["status"] = "requires_attention"
+        (output / "events.json").write_text(json.dumps(events, indent=2), encoding="utf-8")
+        (output / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report["status"] == "captured_checksums_valid" else 1
+
+
 def main(argv=None):
-    from flasher.haldex_flash import main as haldex_main
-    return haldex_main(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        _validate_args(parser, args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    _configure_logging(args)
+    if args.readout:
+        return run_readout(args)
+    if args.ident_only:
+        return run_ident(args)
+    return run_flash(args)
 
 
 if __name__ == "__main__":

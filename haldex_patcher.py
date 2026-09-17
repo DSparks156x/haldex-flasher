@@ -36,8 +36,8 @@ ROUTINE_BYTES = bytes.fromhex("e6fcab19e6fd1100e6fefcf9c4de0200b8ceb748b7b70dfe"
 TRAP_ESCAPE_OPCODE = bytes.fromhex("fa027c02")
 
 
-# Layer-1 checksummed application blocks, from the descriptor table at ECU
-# 0x024000. Mask 0xF0 -> blocks 4..7. (start, size) in ECU read-space addresses.
+# Layer-1 checksummed application blocks, from the descriptor table at Controller
+# 0x024000. Mask 0xF0 -> blocks 4..7. (start, size) in Controller read-space addresses.
 APP_BLOCKS = [
     (0x018000, 0x08000),   # B0F4  core OS, drivers, diag dispatcher
     (0x020000, 0x10000),   # B0F5  vectors, crt0, anti-brick net, valve duty map
@@ -78,10 +78,10 @@ def calculate_c5_sum(data_slice: bytes) -> int:
 
 # CONSUMER AUDIT 2026-09-05 (live Ghidra). Each patch was classified as either
 # FUNCTIONAL (it changes what the controller does) or REPORTING-ONLY (it only
-# changes what the ECU says about itself on CAN). Reporting-only patches are
+# changes what the Controller says about itself on CAN). Reporting-only patches are
 # WORSE THAN USELESS on a diagnostic bench: they make the 0x2C0 flags lie while
 # the underlying behaviour is unchanged, which has already cost this project one
-# wrong conclusion ("ECU healthy" read off patched flags while it sat at 0 Nm).
+# wrong conclusion ("Controller healthy" read off patched flags while it sat at 0 Nm).
 #
 #   FUN_03114C @0x03114C is the 0x2C0 Allrad_1 FRAME BUILDER (callers:
 #   CtrlOutputAllradFrameThread / CtrlOutputIdleThread / CtrlOutputThread). Its
@@ -89,7 +89,7 @@ def calculate_c5_sum(data_slice: bytes) -> int:
 #   whose ONLY consumer is FUN_03114C is reporting-only by definition.
 #
 # REMOVED as reporting-only:
-#   * Notlauf bypass (ECU 0x032880, FUN_032880). Sole caller FUN_03114C, and
+#   * Notlauf bypass (Controller 0x032880, FUN_032880). Sole caller FUN_03114C, and
 #     the return goes straight into FUN_02CD22(0x34, ...) -- one TX bit, no
 #     control path. Removing it makes the bench tell the truth about limp state.
 #     (A second reporting-only patch, Fehler_Allrad_Kupplung @0x021168, was
@@ -109,7 +109,7 @@ def calculate_c5_sum(data_slice: bytes) -> int:
 #   7 FUN_030E68              - returns DAT_0F13CA; sole caller CtrlHLSCThread,
 #                               a control thread, so functional.
 SIMULATOR_PATCHES = [
-    # 2. Force State 1 Normal Operation in StrategicControlThread (ECU 0x01B942)
+    # 2. Force State 1 Normal Operation in StrategicControlThread (Controller 0x01B942)
     # Replaces the entry of StrategicControlThread with:
     #   mov r13, #1           (e0 1d)
     #   mov 0xe57e, r13       (f6 fd 7e e5) -> DAT_00e57e = 1 (State 1 Normal Operation)
@@ -117,29 +117,29 @@ SIMULATOR_PATCHES = [
     #   movb DAT_00e572, rl2  (f7 f2 72 e5) -> DAT_00e572 = 1 (Thread success flag)
     #   rets                  (db 00)
     # This prevents ANY state machine transition out of State 1 (to State 2, 3, 4, 5, 0).
-    # The ECU is permanently locked into State 1 (Normal Operation).
+    # The Controller is permanently locked into State 1 (Normal Operation).
     # The 0x2C0 Allrad_1 status message is NOT patched; it truthfully reads DAT_00e57e == 1 (No Fault).
     (0x01B942, bytes.fromhex("da018abada01f8baf0c4f3f27de5"), bytes.fromhex("e01df6fd7ee5e112f7f272e5db00"), "Force State 1 Normal Operation (StrategicControlThread)"),
 
-    # 3. Emergency fault bypass in StrategicControlSystemStartUpThread (ECU 0x01B932)
+    # 3. Emergency fault bypass in StrategicControlSystemStartUpThread (Controller 0x01B932)
     # Redirects 'calls FUN_01bd5a' (fault entry) to 'calls FUN_01bd02' (normal entry):
     # If conditions are missing at boot/cold start, boot directly into State 1 instead of State 3.
     (0x01B932, bytes.fromhex("da015abd"), bytes.fromhex("da0102bd"), "Boot into State 1 (StartUpThread)"),
 
-    # 4. Kupplung_komplett_offen control bypass in FUN_03bd68 (ECU 0x03BD68)
+    # 4. Kupplung_komplett_offen control bypass in FUN_03bd68 (Controller 0x03BD68)
     # Replaces comparison 'DAT_0f1a78 == 1' with 'movb rl4, #0; rets; nop; nop'
     # Prevents CtrlHLSCThread and CtrlHLSCLimitedThread from forcing ValveOff.
     (0x03BD68, bytes.fromhex("f2fc789a48c13d02"), bytes.fromhex("e108db00cc00cc00"), "Kupplung_komplett_offen control bypass (FUN_03bd68)"),
 
-    # 5. ValveOff bypass in FUN_03de7e (ECU 0x03DE7E)
+    # 5. ValveOff bypass in FUN_03de7e (Controller 0x03DE7E)
     # Replaces 'movb rl4, DAT_0f1af9; rets' with 'movb rl4, #0; rets; nop' -> ValveSetDemand always called
     (0x03DE7E, bytes.fromhex("f3f8f99adb00"), bytes.fromhex("e1c8db00cc00"), "ValveOff bypass (FUN_03de7e)"),
 
-    # 6. Control error bypass in FUN_03ff5e (ECU 0x03FF5E)
+    # 6. Control error bypass in FUN_03ff5e (Controller 0x03FF5E)
     # Replaces 'mov r4, DAT_0f1b9c; rets' with 'mov r4, #0; rets' -> error count forced to 0
     (0x03FF5E, bytes.fromhex("f2f49c9bdb00"), bytes.fromhex("e6f40000db00"), "Control error bypass (FUN_03ff5e)"),
 
-    # 7. Strategic fault flag bypass in FUN_030e68 (ECU 0x030E68)
+    # 7. Strategic fault flag bypass in FUN_030e68 (Controller 0x030E68)
     # Replaces 'movb rl4, DAT_0f13ca; rets' with 'movb rl4, #0; rets; nop' -> pipeline fault flag forced to 0
     (0x030E68, bytes.fromhex("f3f8ca93db00"), bytes.fromhex("e108db00cc00"), "Strategic fault flag bypass (FUN_030e68)"),
 ]
@@ -149,8 +149,8 @@ def patch_firmware(data: bytearray, harden_traps: bool = True, simulator_mode: b
                    start: int = 0x18000, end: int = 0x4ffff) -> dict:
     """
     Applies the complete Anti-Brick Safety Suite (and optional Simulator Mode) to a 320 KB ST10 CPU firmware image:
-    1. Installs Anti-Brick Reset Routine at ECU 0x02027C.
-    2. Installs Anti-Brick Panic Hook at ECU 0x020364.
+    1. Installs Anti-Brick Reset Routine at Controller 0x02027C.
+    2. Installs Anti-Brick Panic Hook at Controller 0x020364.
     3. Replaces all 120 dummy self-loops in Vector Table with TRAP_ESCAPE_OPCODE (0x020002..0x020200).
     4. If simulator_mode is True: bypasses pump/valve faults, Notlauf, and clutch open flags.
     5. Recalculates Layer-1 checksums for selected blocks only.
@@ -160,12 +160,24 @@ def patch_firmware(data: bytearray, harden_traps: bool = True, simulator_mode: b
     blocks = selected_blocks(start, end)
     patch_antibrick = any(address == 0x20000 for address, _ in blocks)
 
-    # 1. Install Reset Routine at ECU 0x02027C
+    # Validate fixed-address preimages before making any changes.
+    if patch_antibrick and (
+            bytes(data[0x2027c:0x2027c+len(ROUTINE_BYTES)]) not in
+            (b'\xff' * len(ROUTINE_BYTES), ROUTINE_BYTES)
+            or bytes(data[0x20364:0x20364+len(HOOK_BYTES)]) not in
+            (bytes.fromhex('da026e030dff'), HOOK_BYTES)):
+        raise ValueError('Recovery hook/routine preimage mismatch')
+    if simulator_mode:
+        for addr, orig, rep, desc in SIMULATOR_PATCHES:
+            if start <= addr <= addr+len(rep)-1 <= end and bytes(data[addr:addr+len(orig)]) not in (orig, rep):
+                raise ValueError(f'Simulator patch preimage mismatch: {desc}')
+
+    # 1. Install Reset Routine at Controller 0x02027C
     routine_off = 0x02027C
     if patch_antibrick:
         data[routine_off:routine_off + len(ROUTINE_BYTES)] = ROUTINE_BYTES
 
-    # 2. Install Panic Hook at ECU 0x020364
+    # 2. Install Panic Hook at Controller 0x020364
     hook_off = 0x020364
     if patch_antibrick:
         data[hook_off:hook_off + len(HOOK_BYTES)] = HOOK_BYTES
@@ -198,7 +210,7 @@ def patch_firmware(data: bytearray, harden_traps: bool = True, simulator_mode: b
             elif data[addr:addr + len(rep)] == rep:
                 sim_patches_applied += 1
             else:
-                print(f"[!] Warning: Simulator patch '{desc}' mismatch at ECU address 0x{addr:06X}")
+                print(f"[!] Warning: Simulator patch '{desc}' mismatch at Controller address 0x{addr:06X}")
 
     # 5. Recalculate Layer-1 checksums only for the selected complete blocks.
     #    FUN_018534 is called with mask 0xF0 -> blocks 4,5,6,7 are ALL verified at
@@ -255,8 +267,8 @@ def main(argv=None):
     print(f"[*] Reading '{in_file}' ({len(data)} bytes, 320 KB CPU memory space)...")
     res = patch_firmware(data, harden_traps=True, simulator_mode=args.simulator_mode)
 
-    print(f"[+] Anti-Brick Routine installed at ECU 0x02027C ({len(ROUTINE_BYTES)} bytes)")
-    print(f"[+] Anti-Brick Panic Hook installed at ECU 0x020364 ({len(HOOK_BYTES)} bytes)")
+    print(f"[+] Anti-Brick Routine installed at Controller 0x02027C ({len(ROUTINE_BYTES)} bytes)")
+    print(f"[+] Anti-Brick Panic Hook installed at Controller 0x020364 ({len(HOOK_BYTES)} bytes)")
     print(f"[+] Hardened {res['traps_hardened']} dummy trap vectors (Scenario C protection active)")
     if args.simulator_mode:
         print(f"[+] Bench Simulator Mode: Applied {res['sim_patches_applied']} bypass patches (Notlauf & valve/pump faults defeated)")
@@ -269,7 +281,7 @@ def main(argv=None):
     with open(out_file, "wb") as f:
         f.write(data)
 
-    print(f"\n[*** SUCCESS ***] Saved patched, bulletproof binary to: '{out_file}'")
+    print(f"\n[*** SUCCESS ***] Saved patched binary to: '{out_file}'")
 
 
 

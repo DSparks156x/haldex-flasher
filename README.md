@@ -1,7 +1,8 @@
 # Haldex Flasher
 This is a project to flash and readout a Gen4 VW Haldex Controller, or probably most other modules with little adaptation. It is somewhat probably derived from pq-flasher, that EPS RE project. Testing was mostly done on a clone SM2 pro, hence the 32 bit shit, panda is untested and socketcan should work.  
 
-It currently does not work in a car over OBD due to TP2 timing/ack issues that the gateway gets mad at, but it works directly connected to a controller. Working on fixing.
+The TP2/KWP implementation is the gateway-proven implementation from
+RNS-E-Hudiy. It is also used directly against the Haldex bench controller.
 
 It also contains haldex_patcher.py, a script for patching a Haldex Gen4 (or at least a 0BR 3016 specifically) binary and correcting its checksums. The flasher automatically runs the patcher to correct checksums and apply anti-brick patches, though they only apply to whatever sector you flash.
 
@@ -16,9 +17,12 @@ The rest of this readme is AI written. It looks fine, but i didn't read it all t
 There is one flash/readout implementation for every CAN adapter:
 
 - `runner.py`: selects and owns J2534, Panda, or SocketCAN; normalizes CAN frames.
-- `haldex_flash.py`: shared flash, recovery, identification, and application dump flows.
+- `haldex_flash.py`: source-identical Hudiy/Haldex protocol and application-readout code.
+- `haldex_flasher.py`: shared flash lifecycle, checksum/commit handling, and fresh boot verification.
 - `haldex_patcher.py`: strict 320 KiB image validation, anti-brick/simulator patches, and both checksum layers.
-- `tp20.py`, `kwp2000.py`, `j2534.py`: protocol and driver modules.
+- `vag_protocols/`: source-identical canonical TP2 and KWP implementation from Hudiy.
+- `tp20.py` and `kwp2000.py`: compatibility imports/facade; neither reimplements the protocols.
+- `j2534.py`: Windows J2534 driver binding.
 
 
 ## Commands
@@ -71,10 +75,12 @@ For flashing, explicitly select the minimum whole sectors covering every
 changed byte and its checksum. The patcher updates only selected sectors:
 checksums in each selected sector, and anti-brick hooks/routine/traps when
 `0x20000..0x2ffff` is selected. It changes no bytes outside the selected range. Flash preparation
-uses the patcher for both ordinary and recovery paths and stops if patching
-fails. `--simulator-mode` remains bench-only. The final StopCommunication ACK
-commits and resets; release the adapter and run a fresh `--ident-only` to check
-application boot. Obsolete flasher flags and command paths are removed.
+uses the patcher for the normal resumable flash path and stops if patching
+fails. Simulator bypass creation is forbidden in this vehicle workflow. The
+final StopCommunication ACK commits and resets; the engine then releases and
+reopens the selected adapter for a fresh application identification. This is a
+boot check, not a binary readback. Obsolete recovery flags and command paths
+are removed.
 
 Standalone patching and checksum commands are now in one tool:
 
@@ -95,6 +101,8 @@ python -m unittest discover -s tests -p test_app_flash_dump.py
 python -m unittest discover -s tests -p test_tp20_upload_receive.py
 python -m unittest discover -s tests -p test_flasher_readout_cli.py
 python -m unittest discover -s tests -p test_flasher_shared.py
+python -m unittest discover -s tests -p test_flasher_engine.py
+python -m unittest discover -s tests -p test_shared_protocols.py
 ```
 
 These tests exercise simulated protocol exchanges, adapter contracts, cleanup,
