@@ -153,6 +153,25 @@ class Kwp:
         logger.info(f"[KWP TX] {req.hex()} ({desc})")
         self.tp.send(req)
         resp = self.tp.recv()
+        deadline = time.monotonic() + 30.0
+        busy_count = 0
+        pending_count = 0
+        while resp and resp[0] == 0x7F:
+            if len(resp) != 3 or resp[1] != req[0]:
+                raise RuntimeError("Malformed or mismatched KWP negative response")
+            if resp[2] == 0x78:
+                pending_count += 1
+                if time.monotonic() >= deadline or pending_count > 30:
+                    raise TimeoutError("KWP pending deadline exceeded")
+                resp = self.tp.recv()  # Pending means wait; never repeat a write.
+                continue
+            if resp[2] == 0x21 and req[0] in (0x1A, 0x33) and busy_count < 3:
+                busy_count += 1
+                time.sleep(0.2)
+                self.tp.send(req)
+                resp = self.tp.recv()
+                continue
+            break
         logger.info(f"[KWP RX] {resp.hex()}")
 
         if resp and resp[0] == 0x7F:
@@ -163,6 +182,31 @@ class Kwp:
             logger.error(f"[KWP NEGATIVE RESPONSE] {err_msg}")
             raise RuntimeError(err_msg)
 
+        if not resp or resp[0] != ((req[0] + 0x40) & 0xFF):
+            raise RuntimeError(f"Unexpected positive KWP response: {resp.hex()}")
+        if req[0] in (0x10, 0x27, 0x1A, 0x31, 0x33, 0x11):
+            if len(resp) < 2 or resp[1] != req[1]:
+                raise RuntimeError("KWP subfunction/routine echo mismatch")
+        if req[0] == 0x27:
+            if req[1] & 1 and len(resp) != 6:
+                raise RuntimeError("Security seed must be four bytes")
+            if not req[1] & 1 and resp != bytes([0x67, req[1], 0x34]):
+                raise RuntimeError("Security key was not accepted (expected status 0x34)")
+        if req[0] == 0x33 and len(resp) != 3:
+            raise RuntimeError("Routine result must contain exactly one status byte")
+        if req[0] == 0x31:
+            expected = {RC_ERASE: b"\x71\xc4\x01", RC_CHECKSUM: b"\x71\xc5"}.get(req[1])
+            if expected is None or resp != expected:
+                raise RuntimeError("Unexpected routine-start response/status")
+        if req[0] == 0x10:
+            expected = {
+                SESSION_EXTENDED: b"\x50\x89",
+                SESSION_PROGRAMMING: b"\x50\x85\x01",
+            }.get(req[1])
+            if expected is None or resp != expected:
+                raise RuntimeError("Unexpected session response/status")
+        if req[0] in (0x36, 0x37, 0x20, 0x82) and len(resp) != 1:
+            raise RuntimeError("Unexpected KWP response length")
         return resp
 
     def session(self, s):              return self.raw(bytes([0x10, s]))
@@ -173,7 +217,9 @@ class Kwp:
         a = struct.pack(">I", addr)[1:]
         s = struct.pack(">I", size)[1:]
         r = self.raw(bytes([0x34]) + a + b"\x00" + s)
-        return r[-1] if r else CHUNK_SIZE
+        if len(r) != 2 or r[1] < 5:
+            raise RuntimeError("Invalid RequestDownload block limit")
+        return r[1]
     def transfer(self, data):          return self.raw(bytes([0x36]) + data)
     def transfer_exit(self):           return self.raw(bytes([0x37]))
     def routine(self, rid, data=b""):  return self.raw(bytes([0x31, rid]) + data)
@@ -192,7 +238,7 @@ def a3(addr):
     return struct.pack(">I", addr)[1:]
 
 
-def reconnect(dev, module: int, tries: int = 15) -> TP20Transport:
+def reconnect(dev, module: int, tries: int = 15, heartbeat: bool = False) -> TP20Transport:
     """Reconnect TP2.0 channel after an ECU reset into loader or application."""
     logger.info(f"[*] Reconnecting TP2.0 to module 0x{module:02X} (up to {tries} attempts)...")
     for i in range(tries):
@@ -200,6 +246,7 @@ def reconnect(dev, module: int, tries: int = 15) -> TP20Transport:
         dev.can_clear(0xFFFF)
         try:
             tp = TP20Transport(dev, module=module, timeout=0.8, debug=True, log_fn=logger.debug)
+            tp.keepalive_after_response = heartbeat
             logger.info(f"  [+] Reconnected on attempt {i+1}!")
             return tp
         except Exception as e:
@@ -338,7 +385,7 @@ def run_ident_only(dev, module: int):
     logger.info("======================================================================")
     logger.info(" ECU Identification, Flash Status & Security Access Test")
     logger.info("======================================================================")
-    tp = reconnect(dev, module=module, tries=5)
+    tp = reconnect(dev, module=module, tries=5, heartbeat=True)
     kwp = Kwp(tp, debug=True)
 
     is_loader = False
@@ -429,7 +476,7 @@ def run_flash(args, dev, img):
         
     # Step 1: Connect TP2.0 in App mode (or detect active Bootloader)
     logger.info("\n[1] TP2.0 connect...")
-    tp = reconnect(dev, module=args.module, tries=5)
+    tp = reconnect(dev, module=args.module, tries=5, heartbeat=True)
     kwp = Kwp(tp, debug=True)
 
     time.sleep(0.1)
@@ -466,6 +513,9 @@ def run_flash(args, dev, img):
         logger.info("[3] Entering Programming Session (0x85) -> ECU soft resets into Bootloader...")
         for attempt in range(3):
             try:
+                # The application may replace/close TP immediately after the
+                # programming-session response; do not heartbeat this edge.
+                tp.keepalive_after_response = False
                 kwp.session(SESSION_PROGRAMMING)
                 break
             except Exception as e:
@@ -486,7 +536,7 @@ def run_flash(args, dev, img):
 
         # Step 4: Reconnect to Loader
         logger.info("[4] Reconnecting TP2.0 channel to resident Bootloader...")
-        tp = reconnect(dev, module=args.module, tries=15)
+        tp = reconnect(dev, module=args.module, tries=15, heartbeat=True)
         kwp = Kwp(tp, debug=True)
         if tp.tx_addr == 0x764:
             raise RuntimeError(
@@ -503,6 +553,8 @@ def run_flash(args, dev, img):
     logger.info("[5] Loader SecurityAccess (Fixed challenge/response)...")
     ldr_seed = kwp.sa_seed(SA_LDR_REQUEST_SEED)
     logger.info(f"    Loader reported seed: {ldr_seed.hex()} (expected: {LOADER_SEED.hex()})")
+    if ldr_seed != LOADER_SEED:
+        raise RuntimeError(f"Unexpected loader challenge: {ldr_seed.hex()}")
     kwp.sa_key(SA_LDR_SEND_KEY, LOADER_KEY)
     logger.info("    [+] Loader unlocked successfully!")
 
@@ -513,8 +565,11 @@ def run_flash(args, dev, img):
     # CRITICAL: Clamp chunk size to a 4-byte (32-bit word) boundary!
     # If chunk size is odd (e.g. 145), the ECU adds a 0xFF padding byte per chunk,
     # which causes flash write address drift and checksum corruption!
-    max_chunk = min(CHUNK_SIZE, blk if blk and blk >= 8 else CHUNK_SIZE)
+    # The loader limit includes the TransferData service byte.
+    max_chunk = min(CHUNK_SIZE, blk - 1)
     chunk = (max_chunk // 4) * 4
+    if chunk < 4:
+        raise RuntimeError("Loader transfer size is too small")
     logger.info(f"    Configured 4-byte aligned chunk size: {chunk} bytes")
 
     # Step 7: Erase routine 0xC4
@@ -526,14 +581,17 @@ def run_flash(args, dev, img):
     for i in range(30):
         time.sleep(0.5)
         try:
-            kwp.tester_present()
             r = kwp.routine_result(RC_ERASE)
             if r[-1:] == b"\x00":
                 break
-        except Exception as e:
+        except TimeoutError as e:
             logger.debug(f"    (erase poll {i}: {e})")
-            tp = reconnect(dev, module=args.module, tries=5)
+            tp = reconnect(dev, module=args.module, tries=5, heartbeat=True)
             kwp = Kwp(tp, debug=True)
+        except RuntimeError as e:
+            if "NRC 0x23" not in str(e):
+                raise
+            logger.debug(f"    (erase poll {i}: {e})")
 
     logger.info(f"    Erase response: {r.hex()}")
     if r[-1:] != b"\x00":
@@ -549,7 +607,6 @@ def run_flash(args, dev, img):
     while buf:
         curr = buf[:chunk]
         kwp.transfer(curr)
-        kwp.tester_present()
         buf = buf[chunk:]
         sent += len(curr)
         pct = (sent / total) * 100.0
@@ -578,6 +635,8 @@ def run_flash(args, dev, img):
     # Step 11: Finalize Flash Session & Reboot to Application
     logger.info("[11] Finalizing Flash Session & Rebooting ECU to Application...")
     try:
+        # The commit/reset replaces the TP channel after its valid response.
+        tp.keepalive_after_response = False
         # StopDiagnosticSession (0x20) verifies state 7 (checksum passed) and transitions out
         logger.info("    Sending StopDiagnosticSession (0x20)...")
         kwp.raw(bytes([0x20]))
@@ -636,14 +695,18 @@ def run_recovery(args, dev, img):
     logger.info("[1] Loader SecurityAccess...")
     ldr_seed = kwp.sa_seed(SA_LDR_REQUEST_SEED)
     logger.info(f"    Seed: {ldr_seed.hex()}")
+    if ldr_seed != LOADER_SEED:
+        raise RuntimeError(f"Unexpected loader challenge: {ldr_seed.hex()}")
     kwp.sa_key(SA_LDR_SEND_KEY, LOADER_KEY)
     logger.info("    [+] Loader unlocked successfully!")
 
     # Step 2: Immediate RequestDownload
     logger.info(f"[2] RequestDownload: Addr 0x{args.start:06X}, Size {size} bytes...")
     blk = kwp.request_download(args.start, size)
-    max_chunk = min(CHUNK_SIZE, blk if blk and blk >= 8 else CHUNK_SIZE)
+    max_chunk = min(CHUNK_SIZE, blk - 1)
     chunk = (max_chunk // 4) * 4
+    if chunk < 4:
+        raise RuntimeError("Loader transfer size is too small")
     logger.info(f"    Chunk size: {chunk} bytes")
 
     # Step 3: Immediate Erase Routine 0xC4
@@ -654,14 +717,17 @@ def run_recovery(args, dev, img):
     for i in range(30):
         time.sleep(0.5)
         try:
-            kwp.tester_present()
             r = kwp.routine_result(RC_ERASE)
             if r[-1:] == b"\x00":
                 break
-        except Exception as e:
+        except TimeoutError as e:
             logger.debug(f"    (erase poll {i}: {e})")
-            tp = reconnect(dev, module=args.module, tries=5)
+            tp = reconnect(dev, module=args.module, tries=5, heartbeat=True)
             kwp = Kwp(tp, debug=True)
+        except RuntimeError as e:
+            if "NRC 0x23" not in str(e):
+                raise
+            logger.debug(f"    (erase poll {i}: {e})")
     if r[-1:] != b"\x00":
         raise RuntimeError(f"Flash erase routine failed! Response: {r.hex()}")
     logger.info("    [+] Sector erased! Bootloader is now permanently locked into flash mode.")
@@ -672,7 +738,6 @@ def run_recovery(args, dev, img):
     total = len(data)
     t0 = time.time()
     while off < total:
-        kwp.tester_present()
         cdata = data[off:off + chunk]
         kwp.transfer(cdata)
         off += len(cdata)
@@ -700,6 +765,7 @@ def run_recovery(args, dev, img):
     # Step 7: Finalize
     logger.info("[7] Finalizing Flash Session & Rebooting ECU...")
     try:
+        tp.keepalive_after_response = False
         logger.info("    Sending StopDiagnosticSession (0x20)...")
         kwp.raw(bytes([0x20]))
         time.sleep(0.05)
@@ -967,6 +1033,7 @@ def capture(reader, output, start, length, passes, window, record, progress,
                 stream.seek(start+offset)
                 stream.write(block)
                 stream.flush()
+                os.fsync(stream.fileno())
                 record({'event': 'window_saved', 'pass': pass_index,
                         'address': start+offset, 'length': size, 'sha256': sha256(block)})
                 progress(pass_index, offset+size, length)
@@ -1023,6 +1090,7 @@ def run_readout(args):
             device.can_clear(0xffff)
             transport = TP20Transport(device, module=args.module, timeout=2.0, debug=True,
                                       log_fn=lambda message: record({'event': 'tp20', 'message': message}))
+            transport.keepalive_after_response = True
             report['ecu_listen_id'] = transport.tx_addr
             if transport.tx_addr != 0x764:
                 raise ProtocolError(f'Expected application at 0x764; received 0x{transport.tx_addr:03X}. No loader commands sent.')
@@ -1043,6 +1111,7 @@ def run_readout(args):
                 device.can_clear(0xffff)
                 transport = TP20Transport(device, module=args.module, timeout=2.0, debug=True,
                                           log_fn=lambda message: record({'event': 'tp20', 'message': message}))
+                transport.keepalive_after_response = True
                 if transport.tx_addr != 0x764:
                     raise ProtocolError('Reconnected ECU is not the application')
                 reader.transport = transport

@@ -4,6 +4,13 @@ from typing import Optional, List, Tuple, Callable
 
 BROADCAST_ADDR = 0x200
 
+TIMING_UNITS_MS = (0.1, 1.0, 10.0, 100.0)
+
+
+def decode_timing_ms(value: int) -> float:
+    """Decode a TP2 timing byte: high 2 bits select units, low 6 bits scale."""
+    return TIMING_UNITS_MS[value >> 6] * (value & 0x3F)
+
 class MessageTimeoutError(TimeoutError):
     pass
 
@@ -13,10 +20,15 @@ class TP20Transport:
         self.module = module
         self.bus = bus
         self.timeout = timeout
+        self.keepalive_after_response = False
+        self.keepalive_interval = 1.0
+        self.last_keepalive = time.monotonic()
         self.msgs: List[Tuple[int, bytes]] = []
 
         self.tx_seq = 0
         self.rx_seq = 0
+        self.block_size = 0
+        self.last_acked_rx_frame: Optional[bytes] = None
         self.time_between_packets = 0.005
 
         self.rx_addr = 0
@@ -24,10 +36,15 @@ class TP20Transport:
         self.debug = debug
         self.log_fn = log_fn or print
 
-        if intercept:
-            self.intercept_channel(module)
-        else:
-            self.open_channel(module)
+        try:
+            if intercept:
+                self.intercept_channel(module)
+            else:
+                self.open_channel(module)
+        except Exception:
+            if self.tx_addr:
+                self.disconnect()
+            raise
 
     def log(self, msg: str):
         if self.debug:
@@ -85,8 +102,8 @@ class TP20Transport:
         dat = None
         while time.monotonic() - start_time < self.timeout:
             msgs = self.device.can_recv(20)
-            for a, payload, _ in msgs:
-                if 0x200 <= a <= 0x2FF and len(payload) >= 7 and payload[1] == 0xD0:
+            for a, payload, bus in msgs:
+                if a == BROADCAST_ADDR + module and bus == self.bus and len(payload) == 7 and payload[1] == 0xD0:
                     dat = payload
                     self.log(f"[TP20] Received setup response from 0x{a:03X}: {dat.hex()}")
                     break
@@ -102,6 +119,8 @@ class TP20Transport:
 
         self.rx_addr = rx
         self.tx_addr = tx
+        if not (0 < rx <= 0x7FF and 0 < tx <= 0x7FF and rx != tx):
+            raise ValueError("Invalid TP2 channel addresses")
         self.log(f"[TP20] Channel open! ECU listens on 0x{tx:03X}, transmits on 0x{rx:03X}")
 
         # Set timing parameters
@@ -109,19 +128,21 @@ class TP20Transport:
         # Block size: 0x0f
         # T1: 0x8a (100ms timeout)
         # T2: 0xff
-        # T3: 0x0a (1ms)
+        # T3: 0x32 (5ms requested; the controller's response is authoritative)
         # T4: 0xff
-        self.can_send(b"\xa0\x0f\x8a\xff\x0a\xff")
+        self.can_send(b"\xa0\x0f\x8a\xff\x32\xff")
 
         dat = self.can_recv()
         self.log(f"[TP20] Timing params response: {dat.hex()}")
-        opcode = dat[0]
-        if opcode != 0xA1:
-            self.log(f"[TP20] Warning: timing params response was 0x{opcode:02X}")
+        if len(dat) != 6 or dat[0] != 0xA1:
+            raise ValueError(f"Invalid TP2 timing response: {dat.hex()}")
 
-        self.time_between_packets = 0.015
+        self.block_size = dat[1]
+        self.time_between_packets = max(1.0, decode_timing_ms(dat[4])) / 1000.0
+        self.log(f"[TP20] Negotiated frame gap: {self.time_between_packets * 1000:.1f} ms")
         self.tx_seq = 0
         self.rx_seq = 0
+        self.last_acked_rx_frame = None
 
     def intercept_channel(self, module: int, timeout: float = 30.0):
         setup_payload = bytes([module]) + b"\xc0\x00\x10\x00\x03\x01"
@@ -133,8 +154,8 @@ class TP20Transport:
             t_chk = time.monotonic()
             while time.monotonic() - t_chk < 0.010:
                 msgs = self.device.can_recv(10)
-                for a, payload, _ in msgs:
-                    if 0x200 <= a <= 0x2FF and len(payload) >= 7 and payload[1] == 0xD0:
+                for a, payload, bus in msgs:
+                    if a == BROADCAST_ADDR + module and bus == self.bus and len(payload) == 7 and payload[1] == 0xD0:
                         dat = payload
                         self.log(f"[TP20] INTERCEPTED setup response from 0x{a:03X}: {dat.hex()}")
                         break
@@ -150,22 +171,30 @@ class TP20Transport:
         status, rx, tx, _ = struct.unpack("<xBHHB", dat)
         self.rx_addr = rx
         self.tx_addr = tx
+        if not (0 < rx <= 0x7FF and 0 < tx <= 0x7FF and rx != tx):
+            raise ValueError("Invalid TP2 channel addresses")
         self.log(f"[TP20] Intercept established! ECU listens on 0x{tx:03X}, transmits on 0x{rx:03X}")
 
         # Send timing parameters immediately (zero delay)
-        self.can_send(b"\xa0\x0f\x8a\xff\x0a\xff")
+        self.can_send(b"\xa0\x0f\x8a\xff\x32\xff")
         dat = self.can_recv()
         self.log(f"[TP20] Timing params response: {dat.hex()}")
+        if len(dat) != 6 or dat[0] != 0xA1:
+            raise ValueError(f"Invalid TP2 timing response: {dat.hex()}")
 
-        self.time_between_packets = 0.005
+        self.block_size = dat[1]
+        self.time_between_packets = max(1.0, decode_timing_ms(dat[4])) / 1000.0
         self.tx_seq = 0
         self.rx_seq = 0
+        self.last_acked_rx_frame = None
 
     def wait_for_ack(self):
         expected_seq = (self.tx_seq + 1) & 0xF
         expected_ack = 0xB0 | expected_seq
         start_time = time.monotonic()
-        while time.monotonic() - start_time < self.timeout:
+        deadline = start_time + self.timeout
+        hard_deadline = start_time + 30.0
+        while time.monotonic() < deadline:
             try:
                 dat = self.can_recv()
             except MessageTimeoutError:
@@ -174,11 +203,23 @@ class TP20Transport:
             if not dat:
                 continue
 
+            if (dat[0] & 0xF0) == 0x90:
+                deadline = min(deadline + 1.0, hard_deadline)
+                self.log(f"[TP20] Wait frame {dat.hex()}; extending response wait")
+                continue
+
+            if dat[0] == 0xA8:
+                raise ConnectionError("ECU closed the TP2.0 channel (A8) while waiting for ACK")
+            if dat[0] == 0xA3:
+                self.log("  [TP20] Keepalive received while waiting for ACK; responding")
+                self.can_send(b"\xa1")
+                continue
+
             if dat[0] == expected_ack:
                 return
 
             # If it's a data packet, queue it for later (implicit ACK)
-            if (dat[0] >> 4) in (0x0, 0x1, 0x2, 0x3):
+            if (dat[0] >> 4) in (0, 1, 2, 3):
                 self.msgs.append((self.rx_addr, dat))
                 return
 
@@ -196,20 +237,28 @@ class TP20Transport:
         if len(dat) > 0xFF:
             raise ValueError("Packet longer than 255 bytes not supported")
 
-        # Discard any stale ACKs or keepalives from previous transaction
-        self.msgs = [(a, d) for a, d in self.msgs if (d[0] & 0xF0) not in (0xB0, 0xA0)]
+        # Discard stale ACKs, but retain channel-control frames for processing.
+        self.msgs = [(a, d) for a, d in self.msgs if d and (d[0] & 0xF0) != 0xB0]
         payload = struct.pack(">H", len(dat)) + dat
+        frames_in_block = 0
 
         while payload:
             last = len(payload) <= 7
+            frames_in_block += 1
+            block_boundary = bool(self.block_size and frames_in_block >= self.block_size)
+            ack_required = last or block_boundary
 
-            to_send = bytes([(0x10 if last else 0x20) | self.tx_seq])
+            # Type 0 is a non-final frame that requests an ACK. Long
+            # TransferData requests can cross the negotiated block boundary.
+            frame_type = 0x10 if last else (0x00 if ack_required else 0x20)
+            to_send = bytes([frame_type | self.tx_seq])
             to_send += payload[:7]
 
             self.can_send(to_send)
 
-            if last:
+            if ack_required:
                 self.wait_for_ack()
+                frames_in_block = 0
 
             self.tx_seq = (self.tx_seq + 1) & 0xF
             payload = payload[7:]
@@ -217,16 +266,23 @@ class TP20Transport:
     def recv(self) -> bytes:
         payload = b""
         expected_len: Optional[int] = None
-        expected_seq: Optional[int] = None
+        expected_seq = self.rx_seq
         start_time = time.monotonic()
+        deadline = start_time + self.timeout
+        hard_deadline = start_time + 30.0
 
-        while time.monotonic() - start_time < self.timeout:
+        while time.monotonic() < deadline:
             try:
                 dat = self.can_recv()
             except MessageTimeoutError:
                 break
 
             if not dat:
+                continue
+
+            if (dat[0] & 0xF0) == 0x90:
+                deadline = min(deadline + 1.0, hard_deadline)
+                self.log(f"[TP20] Wait frame {dat.hex()}; extending response wait")
                 continue
 
             typ, seq = (dat[0] >> 4), (dat[0] & 0xF)
@@ -237,10 +293,7 @@ class TP20Transport:
                     raise ConnectionError('ECU closed the TP2.0 channel (A8) during receive')
                 if dat[0] == 0xA3:
                     self.log("  [TP20] Keepalive frame 0xA3 received, responding...")
-                    try:
-                        self.can_send(b"\xa3")
-                    except Exception:
-                        pass
+                    self.can_send(b"\xa1")
                 continue
 
             # Stray ACK packet (0xB0..0xBF)
@@ -248,30 +301,47 @@ class TP20Transport:
                 self.log(f"  [TP20] Ignoring unexpected ACK packet 0x{dat.hex()}")
                 continue
 
-            # TP2 data opcodes: 0=more/ACK, 1=last/ACK,
-            # 2=more/no ACK, 3=last/no ACK. Large upload responses
-            # request an ACK at the negotiated block boundary (15 frames).
-            if typ not in (0x0, 0x1, 0x2, 0x3):
+            # Data types 0/1 require an ACK; 1/3 terminate the message.
+            if typ not in (0, 1, 2, 3):
                 self.log(f"  [TP20] Ignoring unknown frame type 0x{dat[0]:02X}")
                 continue
 
-            if expected_seq is not None and seq != expected_seq:
-                raise RuntimeError(f"TP2.0 receive sequence mismatch: expected {expected_seq:X}, got {seq:X}")
+            if seq != expected_seq:
+                # If our ACK was lost, TP2 retransmits the exact ACK-requiring
+                # frame. Re-ACK it without appending its payload twice.
+                previous_seq = (expected_seq - 1) & 0xF
+                if (typ in (0, 1) and seq == previous_seq
+                        and dat == self.last_acked_rx_frame):
+                    self.log(
+                        f"  [TP20] Re-ACKing retransmitted frame seq {seq}; "
+                        f"still expecting seq {expected_seq}"
+                    )
+                    self.rx_seq = seq
+                    self.send_ack()
+                    self.rx_seq = expected_seq
+                    continue
+                raise ValueError(f"TP2 sequence mismatch: expected {expected_seq}, got {seq}")
             expected_seq = (seq + 1) & 0xF
             self.rx_seq = seq
             payload += dat[1:]
 
             if expected_len is None and len(payload) >= 2:
                 expected_len = struct.unpack(">H", payload[:2])[0]
+                if not 1 <= expected_len <= 0xFF:
+                    raise ValueError("Unsupported TP2 payload length")
 
-            if typ in (0x0, 0x1):
+            if typ in (1, 3) and (expected_len is None or len(payload) != expected_len + 2):
+                raise ValueError("TP2 final frame length mismatch")
+            if typ in (0, 1):
                 self.send_ack()
+                self.last_acked_rx_frame = dat
 
-            if typ in (0x1, 0x3):
+            if typ in (1, 3):
+                self.rx_seq = expected_seq
                 break
 
             if expected_len is not None and len(payload) >= expected_len + 2:
-                raise RuntimeError("TP2.0 declared length reached without a final data frame")
+                raise ValueError("TP2 payload completed without final frame")
 
         if expected_len is None or len(payload) < expected_len + 2:
             err_msg = (
@@ -282,7 +352,41 @@ class TP20Transport:
             raise MessageTimeoutError(err_msg)
 
         data = payload[2 : expected_len + 2]
+        if self.keepalive_after_response:
+            self.maybe_send_keep_alive()
         return data
+
+    def maybe_send_keep_alive(self, force: bool = False):
+        if force or time.monotonic() - self.last_keepalive >= self.keepalive_interval:
+            self.send_keep_alive()
+
+    def send_keep_alive(self):
+        """Send one channel heartbeat between complete KWP transactions."""
+        self.can_send(b"\xa3")
+        started = time.monotonic()
+        deadline = started + self.timeout
+        hard_deadline = started + 30.0
+        deferred = []
+        try:
+            while time.monotonic() < deadline:
+                dat = self.can_recv()
+                if not dat:
+                    continue
+                if dat[0] in (0xA1, 0x93):
+                    self.last_keepalive = time.monotonic()
+                    return
+                if dat[0] == 0xA3:
+                    self.can_send(b"\xa1")
+                elif dat[0] == 0xA8:
+                    raise ConnectionError("ECU closed TP2 channel during keepalive")
+                elif (dat[0] & 0xF0) == 0x90:
+                    deadline = min(deadline + 1.0, hard_deadline)
+                    self.log(f"[TP20] Wait frame {dat.hex()} during keepalive")
+                elif (dat[0] >> 4) in (0, 1, 2, 3):
+                    deferred.append((self.rx_addr, dat))
+            raise MessageTimeoutError("TP2 keepalive response timed out")
+        finally:
+            self.msgs[0:0] = deferred
 
     def disconnect(self):
         # Disconnect channel: Opcode 0xa8
