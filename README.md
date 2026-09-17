@@ -1,6 +1,8 @@
 # Haldex Flasher
 This is a project to flash and readout a Gen4 VW Haldex Controller, or probably most other modules with little adaptation. It is somewhat probably derived from pq-flasher, that EPS RE project. Testing was mostly done on a clone SM2 pro, hence the 32 bit shit, panda is untested and socketcan should work.  
 
+It currently does not work in a car over OBD due to TP2 timing/ack issues that the gateway gets mad at, but it works directly connected to a controller. Working on fixing.
+
 It also contains haldex_patcher.py, a script for patching a Haldex Gen4 (or at least a 0BR 3016 specifically) binary and correcting its checksums. The flasher automatically runs the patcher to correct checksums and apply anti-brick patches, though they only apply to whatever sector you flash.
 
 The anti-brick patches trigger the haldex to drop back into bootloader ready to reflash on checksum and some other errors, rather than ending up in an unflashable bootloop. If you do not apply them, a bad checksum or some other errors will put the haldex in a bootloop, as the stock error handling routine for many things basically just freezes and lets the watchdog reset, within about 40ms. You cannot start a flash section in 40ms, and will need to open the controller and recover via BSL. See BSL folder for that. 
